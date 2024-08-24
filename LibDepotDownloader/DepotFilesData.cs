@@ -1,7 +1,9 @@
 using System.Collections.Generic;
 
+using SteamKit2;
+
 
 namespace LibDepotDownloader
 {
-    internal sealed record DepotFilesData(DepotDownloadInfo DepotDownloadInfo, string StagingDir, DepotDownloadProgress DepotDownloadProgress, ProtoManifest Manifest, ProtoManifest? PreviousManifest, List<ProtoManifest.FileData> FilteredFiles, HashSet<string> AllFileNames);
+    internal sealed record DepotFilesData(DepotDownloadInfo DepotDownloadInfo, string StagingDir, DepotDownloadProgress DepotDownloadProgress, DepotManifest Manifest, DepotManifest? PreviousManifest, List<DepotManifest.FileData> FilteredFiles, HashSet<string> AllFileNames);
 }

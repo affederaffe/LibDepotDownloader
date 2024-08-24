@@ -1,4 +1,7 @@
+using SteamKit2;
+
+
 namespace LibDepotDownloader
 {
-    public record ChunkMatch(ProtoManifest.ChunkData OldChunk, ProtoManifest.ChunkData NewChunk);
+    public record ChunkMatch(DepotManifest.ChunkData OldChunk, DepotManifest.ChunkData NewChunk);
 }
