@@ -4,7 +4,7 @@ using System.IO;
 
 namespace LibDepotDownloader
 {
-    public class IOUtils
+    internal class IOUtils
     {
         public static bool TryDeleteFile(string path)
         {

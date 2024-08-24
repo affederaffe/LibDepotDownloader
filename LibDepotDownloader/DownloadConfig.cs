@@ -25,9 +25,5 @@ namespace LibDepotDownloader
         public bool VerifyAll { get; set; }
 
         public int MaxDownloads { get; set; } = 1;
-
-        public bool RememberPassword { get; set; }
-
-        public bool UseQrCode { get; set; }
     }
 }

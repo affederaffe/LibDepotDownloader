@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
@@ -39,76 +40,71 @@ namespace LibDepotDownloader
 
         public async Task<ulong> GetSteam3DepotManifestAsync(uint depotId, uint appId, string branch, string? betaPassword = null)
         {
-            while (true)
+            KeyValue? depots = await GetSteam3AppSectionAsync(appId, EAppInfoSection.Depots);
+
+            if (depots is null)
+                throw new InvalidOperationException($"Failed to retrieve depots for app {appId}.");
+
+            KeyValue depotChild = depots[depotId.ToString(NumberFormatInfo.InvariantInfo)];
+
+            if (depotChild == KeyValue.Invalid)
+                throw new InvalidOperationException($"App {appId} doesn't contain a depot {depotId}.");
+
+            // Shared depots can either provide manifests, or leave you relying on their parent app.
+            // It seems that with the latter, "sharedinstall" will exist (and equals 2 in the one existance I know of).
+            // Rather than relay on the unknown sharedinstall key, just look for manifests. Test cases: 111710, 346680.
+            if (depotChild["manifests"] == KeyValue.Invalid && depotChild["depotfromapp"] != KeyValue.Invalid)
             {
-                KeyValue? depots = await GetSteam3AppSectionAsync(appId, EAppInfoSection.Depots);
+                uint otherAppId = depotChild["depotfromapp"].AsUnsignedInteger();
+                // This shouldn't ever happen, but ya never know with Valve. Don't infinite loop.
+                if (otherAppId == appId)
+                    throw new InvalidOperationException($"App {appId}, Depot {depotId} has depotfromapp of {otherAppId}!");
+
+                appId = otherAppId;
+                betaPassword = null;
+                depots = await GetSteam3AppSectionAsync(appId, EAppInfoSection.Depots);
+
                 if (depots is null)
                     throw new InvalidOperationException($"Failed to retrieve depots for app {appId}.");
 
-                KeyValue depotChild = depots[depotId.ToString(NumberFormatInfo.InvariantInfo)];
                 if (depotChild == KeyValue.Invalid)
                     throw new InvalidOperationException($"App {appId} doesn't contain a depot {depotId}.");
-
-                // Shared depots can either provide manifests, or leave you relying on their parent app.
-                // It seems that with the latter, "sharedinstall" will exist (and equals 2 in the one existance I know of).
-                // Rather than relay on the unknown sharedinstall key, just look for manifests. Test cases: 111710, 346680.
-                if (depotChild["manifests"] == KeyValue.Invalid && depotChild["depotfromapp"] != KeyValue.Invalid)
-                {
-                    uint otherAppId = depotChild["depotfromapp"].AsUnsignedInteger();
-                    // This shouldn't ever happen, but ya never know with Valve. Don't infinite loop.
-                    if (otherAppId == appId)
-                        throw new InvalidOperationException($"App {appId}, Depot {depotId} has depotfromapp of {otherAppId}!");
-
-                    await steam3Session.GetAppInfoAsync(otherAppId);
-
-                    appId = otherAppId;
-                    betaPassword = null;
-                    continue;
-                }
-
-                KeyValue manifests = depotChild["manifests"];
-                KeyValue manifestsEncrypted = depotChild["encryptedmanifests"];
-
-                if (manifests.Children.Count == 0 && manifestsEncrypted.Children.Count == 0)
-                    throw new InvalidOperationException($"No Manifests for appId {appId}.");
-
-                KeyValue node = manifests[branch]["gid"];
-
-                if (node == KeyValue.Invalid && !string.Equals(branch, SteamConstants.DefaultBranch, StringComparison.OrdinalIgnoreCase))
-                {
-                    KeyValue nodeEncrypted = manifestsEncrypted[branch];
-                    if (nodeEncrypted == KeyValue.Invalid)
-                        throw new InvalidOperationException($"No encrypted Manifests for appId {appId} on branch {branch}.");
-
-                    KeyValue encryptedGid = nodeEncrypted["gid"];
-                    if (encryptedGid != KeyValue.Invalid && betaPassword is not null)
-                    {
-                        Dictionary<string, byte[]>? betaKeys = await steam3Session.GetAppBetaKeysAsync(appId, betaPassword);
-                        if (betaKeys is null || !betaKeys.TryGetValue(branch, out byte[]? key))
-                            throw new UnauthorizedAccessException($"Failed to retrieve beta keys for {appId} on branch {branch} with password {betaPassword}.");
-
-                        byte[] input = Convert.FromHexString(encryptedGid.Value!);
-                        byte[] manifestBytes;
-                        try
-                        {
-                            manifestBytes = CryptoHelper.SymmetricDecryptECB(input, key);
-                        }
-                        catch (Exception e)
-                        {
-                            throw new InvalidOperationException($"Failed to decrypt branch {branch}: {e.Message}");
-                        }
-
-                        return BitConverter.ToUInt64(manifestBytes, 0);
-                    }
-
-                    throw new InvalidOperationException($"Unhandled depot encryption for depotId {depotId}");
-                }
-
-                if (node.Value is null)
-                    throw new InvalidOperationException($"No gid on branch {branch}.");
-
-                return ulong.Parse(node.Value, NumberFormatInfo.InvariantInfo);
             }
+
+            KeyValue manifests = depotChild["manifests"];
+            KeyValue manifestsEncrypted = depotChild["encryptedmanifests"];
+
+            if (manifests.Children.Count == 0 && manifestsEncrypted.Children.Count == 0)
+                throw new InvalidOperationException($"No Manifests for appId {appId}.");
+
+            KeyValue node = manifests[branch]["gid"];
+
+            if (node == KeyValue.Invalid && !string.Equals(branch, SteamConstants.DefaultBranch, StringComparison.OrdinalIgnoreCase))
+            {
+                KeyValue nodeEncrypted = manifestsEncrypted[branch];
+
+                if (nodeEncrypted == KeyValue.Invalid)
+                    throw new InvalidOperationException($"No encrypted Manifests for appId {appId} on branch {branch}.");
+
+                KeyValue encryptedGid = nodeEncrypted["gid"];
+
+                if (encryptedGid == KeyValue.Invalid || betaPassword is null)
+                    throw new InvalidOperationException($"Unhandled depot encryption for depotId {depotId}");
+
+                Dictionary<string, byte[]>? betaKeys = await steam3Session.GetAppBetaKeysAsync(appId, betaPassword);
+
+                if (betaKeys is null || !betaKeys.TryGetValue(branch, out byte[]? key))
+                    throw new UnauthorizedAccessException($"Failed to retrieve beta keys for {appId} on branch {branch} with password {betaPassword}.");
+
+                byte[] input = Convert.FromHexString(encryptedGid.Value!);
+                byte[] manifestBytes = CryptoHelper.SymmetricDecrypt(input, key);
+                return BitConverter.ToUInt64(manifestBytes, 0);
+            }
+
+            if (node.Value is null)
+                throw new InvalidOperationException($"No gid on branch {branch}.");
+
+            return ulong.Parse(node.Value, NumberFormatInfo.InvariantInfo);
         }
 
         public async Task<string?> GetAppNameAsync(uint appId)
@@ -281,7 +277,7 @@ namespace LibDepotDownloader
             }
 
             foreach (DepotFilesData depotFileData in depotsToDownload)
-                await DownloadSteam3AsyncDepotFilesAsync(cdnClientPool, depotFileData, allFileNamesAllDepots, globalDownloadProgress);
+                await DownloadSteam3DepotFilesAsync(cdnClientPool, depotFileData, allFileNamesAllDepots, globalDownloadProgress, cancellationToken);
 
             return depots.Select(static x => x.InstallDir).ToArray();
         }
@@ -289,9 +285,8 @@ namespace LibDepotDownloader
         private async Task<DepotFilesData?> ProcessDepotManifestAndFilesAsync(CdnClientPool cdnClientPool, DepotDownloadInfo depot, CancellationToken cancellationToken, IProgress<double>? progress = null)
         {
             DepotDownloadProgress depotDownloadProgress = new(progress);
-            ProtoManifest? oldProtoManifest = null;
-
-            DepotManifest? depotManifest = null;
+            DepotManifest? oldDepotManifest = null;
+            DepotManifest? newManifest = null;
             ulong manifestRequestCode = 0;
             DateTime manifestRequestCodeExpiration = DateTime.MinValue;
 
@@ -317,7 +312,7 @@ namespace LibDepotDownloader
                             return null;
                     }
 
-                    depotManifest = await cdnClientPool.CdnClient.DownloadManifestAsync(depot.Id, depot.ManifestId, manifestRequestCode, connection, depot.DepotKey, cdnClientPool.ProxyServer).ConfigureAwait(false);
+                    newManifest = await cdnClientPool.CdnClient.DownloadManifestAsync(depot.Id, depot.ManifestId, manifestRequestCode, connection, depot.DepotKey, cdnClientPool.ProxyServer).ConfigureAwait(false);
                     cdnClientPool.ReturnConnection(connection);
                 }
                 catch (TaskCanceledException) { }
@@ -330,22 +325,20 @@ namespace LibDepotDownloader
                 {
                     return null;
                 }
-            } while (depotManifest is null);
+            } while (newManifest is null);
 
             // Throw the cancellation exception if requested so that this task is marked failed
             cancellationToken.ThrowIfCancellationRequested();
 
-            ProtoManifest newProtoManifest = new(depotManifest, depot.ManifestId);
-
-            newProtoManifest.Files.Sort(static (x, y) => string.Compare(x.FileName, y.FileName, StringComparison.Ordinal));
+            newManifest.Files!.Sort(static (x, y) => string.Compare(x.FileName, y.FileName, StringComparison.Ordinal));
 
             string stagingDir = Path.Combine(depot.InstallDir, SteamConstants.StagingDir);
 
-            List<ProtoManifest.FileData> filesAfterExclusions = newProtoManifest.Files.AsParallel().Where(f => TestIsFileIncluded(f.FileName)).ToList();
+            List<DepotManifest.FileData> filesAfterExclusions = newManifest.Files.AsParallel().Where(f => TestIsFileIncluded(f.FileName)).ToList();
             HashSet<string> allFileNames = new(filesAfterExclusions.Count);
 
             // Pre-process
-            foreach (ProtoManifest.FileData file in filesAfterExclusions)
+            foreach (DepotManifest.FileData file in filesAfterExclusions)
             {
                 allFileNames.Add(file.FileName);
 
@@ -367,22 +360,28 @@ namespace LibDepotDownloader
                 }
             }
 
-            return new DepotFilesData(depot, stagingDir, depotDownloadProgress, newProtoManifest, oldProtoManifest, filesAfterExclusions, allFileNames);
+            return new DepotFilesData(depot, stagingDir, depotDownloadProgress, newManifest, oldDepotManifest, filesAfterExclusions, allFileNames);
         }
 
-        private async Task DownloadSteam3AsyncDepotFilesAsync(CdnClientPool cdnClientPool, DepotFilesData depotFilesData, HashSet<string> allFileNamesAllDepots, GlobalDownloadProgress downloadProgress)
+        private async Task DownloadSteam3DepotFilesAsync(CdnClientPool cdnClientPool, DepotFilesData depotFilesData, HashSet<string> allFileNamesAllDepots, GlobalDownloadProgress downloadProgress, CancellationToken cancellationToken)
         {
-            ProtoManifest.FileData[] files = depotFilesData.FilteredFiles.Where(static f => !f.Flags.HasFlag(EDepotFileFlag.Directory)).ToArray();
-            ConcurrentQueue<(FileStreamData FileStreamData, ProtoManifest.FileData FileData, ProtoManifest.ChunkData Chunk)> networkChunkQueue = new();
+            DepotManifest.FileData[] files = depotFilesData.FilteredFiles.Where(static f => !f.Flags.HasFlag(EDepotFileFlag.Directory)).ToArray();
+            ConcurrentQueue<(FileStreamData FileStreamData, DepotManifest.FileData FileData, DepotManifest.ChunkData Chunk)> networkChunkQueue = new();
 
-            ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = downloadConfig.MaxDownloads };
-            await Parallel.ForEachAsync(files, parallelOptions, async (file, token) => await DownloadSteam3AsyncDepotFileAsync(depotFilesData, file, networkChunkQueue, token));
-            await Parallel.ForEachAsync(networkChunkQueue, parallelOptions, async (q, cancellationToken) => await DownloadSteam3DepotFileChunkAsync(cdnClientPool, downloadProgress, depotFilesData, q.FileData, q.FileStreamData, q.Chunk, cancellationToken));
+            foreach (DepotManifest.FileData fileData in files)
+                await DownloadSteam3AsyncDepotFileAsync(depotFilesData, fileData, networkChunkQueue, cancellationToken);
+
+            foreach ((FileStreamData FileStreamData, DepotManifest.FileData FileData, DepotManifest.ChunkData Chunk) q in networkChunkQueue)
+                await DownloadSteam3DepotFileChunkAsync(cdnClientPool, downloadProgress, depotFilesData, q.FileData, q.FileStreamData, q.Chunk, cancellationToken);
 
             // Check for deleted files if updating the depot.
             if (depotFilesData.PreviousManifest is not null)
             {
-                HashSet<string> previousFilteredFiles = depotFilesData.PreviousManifest.Files.AsParallel().Where(f => TestIsFileIncluded(f.FileName)).Select(static f => f.FileName).ToHashSet();
+                HashSet<string> previousFilteredFiles = depotFilesData.PreviousManifest.Files!
+                    .AsParallel()
+                    .Where(f => TestIsFileIncluded(f.FileName))
+                    .Select(static f => f.FileName)
+                    .ToHashSet();
 
                 // Check if we are writing to a single output directory. If not, each depot folder is managed independently
                 // Of the list of files in the previous manifest, remove any file names that exist in the current set of all file names
@@ -399,15 +398,15 @@ namespace LibDepotDownloader
             }
         }
 
-        private async Task DownloadSteam3AsyncDepotFileAsync(DepotFilesData depotFilesData, ProtoManifest.FileData file, ConcurrentQueue<(FileStreamData, ProtoManifest.FileData, ProtoManifest.ChunkData)> networkChunkQueue, CancellationToken cancellationToken)
+        private async Task DownloadSteam3AsyncDepotFileAsync(DepotFilesData depotFilesData, DepotManifest.FileData file, ConcurrentQueue<(FileStreamData, DepotManifest.FileData, DepotManifest.ChunkData)> networkChunkQueue, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             DepotDownloadInfo depot = depotFilesData.DepotDownloadInfo;
-            ProtoManifest? oldProtoManifest = depotFilesData.PreviousManifest;
-            ProtoManifest.FileData? oldManifestFile = null;
-            if (oldProtoManifest is not null)
-                oldManifestFile = oldProtoManifest.Files.SingleOrDefault(f => f.FileName == file.FileName);
+            DepotManifest? oldDepotManifest = depotFilesData.PreviousManifest;
+            DepotManifest.FileData? oldManifestFile = null;
+            if (oldDepotManifest is not null)
+                oldManifestFile = oldDepotManifest.Files?.SingleOrDefault(f => f.FileName == file.FileName);
 
             string fileFinalPath = Path.Combine(depot.InstallDir, file.FileName);
             string fileStagingPath = Path.Combine(depotFilesData.StagingDir, file.FileName);
@@ -415,7 +414,7 @@ namespace LibDepotDownloader
             // This may still exist if the previous run exited before cleanup
             IOUtils.TryDeleteFile(fileStagingPath);
 
-            List<ProtoManifest.ChunkData> neededChunks;
+            List<DepotManifest.ChunkData> neededChunks;
             FileInfo fi = new(fileFinalPath);
             bool fileDidExist = fi.Exists;
             if (!fileDidExist)
@@ -446,9 +445,9 @@ namespace LibDepotDownloader
                         // we have a version of this file, but it doesn't fully match what we want
                         List<ChunkMatch> matchingChunks = [];
 
-                        foreach (ProtoManifest.ChunkData chunk in file.Chunks)
+                        foreach (DepotManifest.ChunkData chunk in file.Chunks)
                         {
-                            ProtoManifest.ChunkData? oldChunk = oldManifestFile.Chunks.FirstOrDefault(c => c.ChunkId.SequenceEqual(chunk.ChunkId));
+                            DepotManifest.ChunkData? oldChunk = oldManifestFile.Chunks.FirstOrDefault(c => c.ChunkID!.SequenceEqual(chunk.ChunkID!));
                             if (oldChunk != null)
                                 matchingChunks.Add(new ChunkMatch(oldChunk, chunk));
                             else
@@ -465,14 +464,16 @@ namespace LibDepotDownloader
                             {
                                 fsOld.Seek((long)match.OldChunk.Offset, SeekOrigin.Begin);
 
-                                byte[] tmp = new byte[match.OldChunk.UncompressedLength];
-                                await fsOld.ReadAsync(tmp, cancellationToken);
+                                int chunkLength = (int)match.OldChunk.UncompressedLength;
+                                byte[] chunk = ArrayPool<byte>.Shared.Rent(chunkLength);
+                                int read = await fsOld.ReadAsync(chunk, cancellationToken);
 
-                                byte[] adler = Utils.AdlerHash(tmp);
-                                if (!adler.SequenceEqual(match.OldChunk.Checksum))
+                                uint adler = Utils.AdlerHash(chunk.AsSpan(read));
+                                if (adler != match.OldChunk.Checksum)
                                     neededChunks.Add(match.NewChunk);
                                 else
                                     copyChunks.Add(match);
+                                ArrayPool<byte>.Shared.Return(chunk);
                             }
                         }
 
@@ -495,11 +496,13 @@ namespace LibDepotDownloader
                             {
                                 fsOld.Seek((long)match.OldChunk.Offset, SeekOrigin.Begin);
 
-                                byte[] tmp = new byte[match.OldChunk.UncompressedLength];
-                                await fsOld.ReadAsync(tmp, cancellationToken);
+                                int chunkLength = (int)match.OldChunk.UncompressedLength;
+                                byte[] chunk = ArrayPool<byte>.Shared.Rent(chunkLength);
+                                int read = await fsOld.ReadAsync(chunk, cancellationToken);
 
                                 fs.Seek((long)match.NewChunk.Offset, SeekOrigin.Begin);
-                                await fs.WriteAsync(tmp, cancellationToken);
+                                await fs.WriteAsync(chunk.AsMemory(read), cancellationToken);
+                                ArrayPool<byte>.Shared.Return(chunk);
                             }
 
                             File.Delete(fileStagingPath);
@@ -549,7 +552,7 @@ namespace LibDepotDownloader
 
             FileStreamData fileStreamData = new(null, new SemaphoreSlim(1), neededChunks.Count);
 
-            foreach (ProtoManifest.ChunkData chunk in neededChunks)
+            foreach (DepotManifest.ChunkData chunk in neededChunks)
                 networkChunkQueue.Enqueue((fileStreamData, file, chunk));
         }
 
@@ -557,9 +560,9 @@ namespace LibDepotDownloader
             CdnClientPool cdnClientPool,
             GlobalDownloadProgress downloadProgress,
             DepotFilesData depotFilesData,
-            ProtoManifest.FileData file,
+            DepotManifest.FileData file,
             FileStreamData fileStreamData,
-            ProtoManifest.ChunkData chunk,
+            DepotManifest.ChunkData chunk,
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -569,7 +572,7 @@ namespace LibDepotDownloader
 
             DepotManifest.ChunkData data = new()
             {
-                ChunkID = chunk.ChunkId,
+                ChunkID = chunk.ChunkID,
                 Checksum = chunk.Checksum,
                 Offset = chunk.Offset,
                 CompressedLength = chunk.CompressedLength,
