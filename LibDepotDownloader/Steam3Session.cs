@@ -12,163 +12,149 @@ using SteamKit2.Internal;
 
 namespace LibDepotDownloader
 {
-    public class Steam3Session
+    public sealed class Steam3Session : IDisposable
     {
-        private readonly DownloadConfig _downloadConfig;
-        private readonly SteamUser.LogOnDetails _logOnDetails;
-        private readonly ISteamAuthenticator _steamAuthenticator;
-        private readonly SteamClient _steamClient;
-        private readonly CallbackManager _callbackManager;
+        private readonly SteamUser.LogOnDetails _logOnDetails = new();
         private readonly SteamUser _steamUser;
-        private readonly SteamApps _steamApps;
-        private readonly SteamContent _steamContent;
         private readonly SteamCloud _steamCloud;
-        private readonly SteamUnifiedMessages _steamUnifiedMessages;
         private readonly SteamUnifiedMessages.UnifiedService<IPublishedFile> _steamPublishedFile;
 
-        private bool _reconnect;
+        private readonly Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo> _appInfos = [];
+        private readonly Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo> _packageInfos = [];
+        private readonly Dictionary<uint, Dictionary<string, byte[]>> _appBetaPasswords = [];
+
+        private readonly TaskCompletionSource<SteamApps.LicenseListCallback> _licenseListTsc = new();
+
+        private TaskCompletionSource? _connectTcs;
+        private TaskCompletionSource<EResult>? _logOnTcs;
+
         private bool _isConnected;
         private bool _isLoggedOn;
-        private ReadOnlyCollection<SteamApps.LicenseListCallback.License>? _licenseList;
-        private AuthSession? _authSession;
-        private string? _previousGuardData;
 
-        public Steam3Session(DownloadConfig downloadConfig, SteamUser.LogOnDetails details, ISteamAuthenticator steamAuthenticator)
+        public Steam3Session()
         {
-            _downloadConfig = downloadConfig;
-            _logOnDetails = details;
-            _steamAuthenticator = steamAuthenticator;
-            SteamConfiguration config = SteamConfiguration.Create(static builder => builder.WithHttpClientFactory(HttpClientFactory.CreateIPv4HttpClient));
-            _steamClient = new SteamClient(config);
-            _callbackManager = new CallbackManager(_steamClient);
-            _steamUser = _steamClient.GetHandler<SteamUser>()!;
-            _steamApps = _steamClient.GetHandler<SteamApps>()!;
-            _steamContent = _steamClient.GetHandler<SteamContent>()!;
-            _steamCloud = _steamClient.GetHandler<SteamCloud>()!;
-            _steamUnifiedMessages = _steamClient.GetHandler<SteamUnifiedMessages>()!;
-            _steamPublishedFile = _steamUnifiedMessages.CreateService<IPublishedFile>();
-            _callbackManager.Subscribe<SteamClient.ConnectedCallback>(OnConnectedAsync);
-            _callbackManager.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
-            _callbackManager.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
-            _callbackManager.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
-            _callbackManager.Subscribe<SteamApps.LicenseListCallback>(OnLicenseList);
-            Connect();
+            SteamConfiguration config = SteamConfiguration.Create(static builder => builder
+                .WithHttpClientFactory(HttpClientFactory.CreateIPv4HttpClient));
+            SteamClient = new SteamClient(config);
+            _steamUser = SteamClient.GetHandler<SteamUser>()!;
+            SteamApps = SteamClient.GetHandler<SteamApps>()!;
+            SteamContent = SteamClient.GetHandler<SteamContent>()!;
+            _steamCloud = SteamClient.GetHandler<SteamCloud>()!;
+            SteamUnifiedMessages steamUnifiedMessages = SteamClient.GetHandler<SteamUnifiedMessages>()!;
+            _steamPublishedFile = steamUnifiedMessages.CreateService<IPublishedFile>();
+            SteamClient.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
+            SteamClient.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
+            SteamClient.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
+            SteamClient.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
+            SteamClient.Subscribe<SteamApps.LicenseListCallback>(OnLicenseList);
         }
 
-        public async Task LoginAsync(CancellationToken cancellationToken)
+        public async ValueTask ConnectAsync(CancellationToken cancellationToken)
         {
-            await Task.Run(() =>
-            {
-                while (!cancellationToken.IsCancellationRequested && !_isLoggedOn)
-                    _callbackManager.RunWaitCallbacks();
-            }, CancellationToken.None);
+            if (_isConnected)
+                return;
+
+            _connectTcs = new TaskCompletionSource();
+            await using CancellationTokenRegistration disposable = cancellationToken.Register(() => _connectTcs.TrySetCanceled());
+            SteamClient.Connect();
+            await _connectTcs.Task;
         }
 
-        private async void OnLoggedOn(SteamUser.LoggedOnCallback loggedOn)
+        public async ValueTask<EResult> LogOnAsync(AuthPollResult authPollResult, CancellationToken cancellationToken)
         {
-            switch (loggedOn.Result)
-            {
-                case EResult.AccountLoginDeniedNeedTwoFactor:
-                    Disconnect(false);
-                    _logOnDetails.TwoFactorCode = await _steamAuthenticator.GetDeviceCodeAsync(false);
-                    Connect();
-                    break;
-                case EResult.AccountLogonDenied:
-                    Disconnect(false);
-                    _logOnDetails.AuthCode = await _steamAuthenticator.GetEmailCodeAsync(loggedOn.EmailDomain!, false);
-                    Connect();
-                    break;
-                case EResult.InvalidPassword when _downloadConfig.RememberPassword && _logOnDetails.AccessToken is not null:
-                    Disconnect(false);
-                    (_logOnDetails.Username, _logOnDetails.Password, _logOnDetails.ShouldRememberPassword) = await _steamAuthenticator.ProvideLoginDetailsAsync();
-                    Connect();
-                    break;
-                case EResult.TryAnotherCM:
-                    Reconnect();
-                    break;
-                case EResult.ServiceUnavailable:
-                    Disconnect(false);
-                    break;
-                case EResult.OK:
-                    _isLoggedOn = true;
-                    break;
-                case not EResult.OK:
-                    Disconnect(true);
-                    break;
-            }
+            if (_isLoggedOn)
+                return EResult.OK;
+
+            _logOnTcs = new TaskCompletionSource<EResult>();
+            await using CancellationTokenRegistration disposable = cancellationToken.Register(() => _logOnTcs.TrySetCanceled());
+            _logOnDetails.Username = authPollResult.AccountName;
+            _logOnDetails.AccessToken = authPollResult.RefreshToken;
+            _steamUser.LogOn(_logOnDetails);
+            return await _logOnTcs.Task;
         }
 
         private void OnLicenseList(SteamApps.LicenseListCallback licenseList)
         {
-            if (licenseList.Result != EResult.OK)
-                return;
-            _licenseList = licenseList.LicenseList;
+            _licenseListTsc.TrySetResult(licenseList);
         }
 
-        public SteamClient SteamClient => _steamClient;
+        public SteamClient SteamClient { get; }
 
-        public SteamApps SteamApps => _steamApps;
+        public SteamApps SteamApps { get; }
 
-        public SteamContent SteamContent => _steamContent;
+        public SteamContent SteamContent { get; }
 
         public async Task<SteamApps.PICSProductInfoCallback.PICSProductInfo?> GetAppInfoAsync(uint appId)
         {
-            SteamApps.PICSTokensCallback methodTokens = await _steamApps.PICSGetAccessTokens(appId, null);
+            if (_appInfos.TryGetValue(appId, out SteamApps.PICSProductInfoCallback.PICSProductInfo? cachedAppInfo))
+                return cachedAppInfo;
+
+            SteamApps.PICSTokensCallback methodTokens = await SteamApps.PICSGetAccessTokens(appId, null);
             if (methodTokens.AppTokensDenied.Contains(appId))
                 return null;
 
             SteamApps.PICSRequest request = new(appId) { AccessToken = methodTokens.AppTokens.GetValueOrDefault(appId, 0UL) };
-            AsyncJobMultiple<SteamApps.PICSProductInfoCallback>.ResultSet productInfos = await _steamApps.PICSGetProductInfo(request, null);
+            AsyncJobMultiple<SteamApps.PICSProductInfoCallback>.ResultSet productInfos = await SteamApps.PICSGetProductInfo(request, null);
             if (productInfos.Results is null)
                 return null;
 
             foreach (SteamApps.PICSProductInfoCallback result in productInfos.Results)
             {
-                if (result.Apps.TryGetValue(appId, out SteamApps.PICSProductInfoCallback.PICSProductInfo? productInfo))
-                    return productInfo;
+                foreach (KeyValuePair<uint,SteamApps.PICSProductInfoCallback.PICSProductInfo> appInfo in result.Apps)
+                    _appInfos[appInfo.Key] = appInfo.Value;
+
+                foreach (uint unknownApp in result.UnknownApps)
+                    _appInfos.Remove(unknownApp);
             }
 
-            return null;
+            return _appInfos.GetValueOrDefault(appId);
         }
 
-        public async Task<Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo>?> GetPackageInfoAsync(IList<uint> packageIds)
+        public async Task<Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo>?> GetPackageInfoAsync(IEnumerable<uint> packageIds)
         {
-            if (packageIds.Count == 0)
-                return null;
+            List<uint> packages = packageIds.ToList();
 
-            IReadOnlyCollection<SteamApps.LicenseListCallback.License>? licences = await GetLicenseListAsync();
-            if (licences is null)
-                return null;
+            if (packages.All(_packageInfos.ContainsKey))
+                return _packageInfos;
 
-            IEnumerable<SteamApps.PICSRequest> packageRequests = packageIds.Select(id => new SteamApps.PICSRequest(id) { AccessToken = licences.FirstOrDefault(licence => licence.PackageID == id)?.AccessToken ?? 0 });
-            AsyncJobMultiple<SteamApps.PICSProductInfoCallback>.ResultSet productInfos = await _steamApps.PICSGetProductInfo(Enumerable.Empty<SteamApps.PICSRequest>(), packageRequests);
-            return productInfos.Results?.SelectMany(static x => x.Packages.Values).ToDictionary(static x => x.ID, static x => x);
+            packages.RemoveAll(_packageInfos.ContainsKey);
+            IReadOnlyCollection<SteamApps.LicenseListCallback.License> licences = await GetLicenseListAsync();
+            IEnumerable<SteamApps.PICSRequest> packageRequests = packages.Select(id => new SteamApps.PICSRequest(id) { AccessToken = licences.FirstOrDefault(licence => licence.PackageID == id)?.AccessToken ?? 0 });
+            AsyncJobMultiple<SteamApps.PICSProductInfoCallback>.ResultSet productInfos = await SteamApps.PICSGetProductInfo([], packageRequests);
+
+            foreach (SteamApps.PICSProductInfoCallback packageInfo in productInfos.Results!)
+            {
+                foreach (KeyValuePair<uint,SteamApps.PICSProductInfoCallback.PICSProductInfo> package in packageInfo.Packages)
+                    _packageInfos[package.Key] = package.Value;
+
+                foreach (uint unknownPackage in packageInfo.UnknownPackages)
+                    _packageInfos.Remove(unknownPackage);
+            }
+
+            return _packageInfos;
         }
 
         public async Task<bool> TryRequestFreeAppLicenseAsync(uint appId)
         {
-            try
-            {
-                SteamApps.FreeLicenseCallback response = await _steamApps.RequestFreeLicense(appId);
-                return response.GrantedApps.Contains(appId);
-            }
-            catch (TaskCanceledException)
-            {
-                return false;
-            }
+            SteamApps.FreeLicenseCallback response = await SteamApps.RequestFreeLicense(appId);
+            return response.GrantedApps.Contains(appId);
         }
 
         public async Task<byte[]?> RequestDepotKeyAsync(uint depotId, uint appId = 0)
         {
-            SteamApps.DepotKeyCallback response = await _steamApps.GetDepotDecryptionKey(depotId, appId);
+            SteamApps.DepotKeyCallback response = await SteamApps.GetDepotDecryptionKey(depotId, appId);
             return response.Result != EResult.OK ? null : response.DepotKey;
         }
 
-        public async Task<ulong> GetDepotManifestRequestCodeAsync(uint depotId, uint appId, ulong manifestId, string branch) => await _steamContent.GetManifestRequestCode(depotId, appId, manifestId, branch);
+        public async Task<ulong> GetDepotManifestRequestCodeAsync(uint depotId, uint appId, ulong manifestId, string branch) => await SteamContent.GetManifestRequestCode(depotId, appId, manifestId, branch);
 
         public async Task<Dictionary<string, byte[]>?> GetAppBetaKeysAsync(uint appId, string password)
         {
-            SteamApps.CheckAppBetaPasswordCallback result = await _steamApps.CheckAppBetaPassword(appId, password);
+            if (_appBetaPasswords.TryGetValue(appId, out Dictionary<string, byte[]>? appBetaPasswords))
+                return appBetaPasswords;
+
+            SteamApps.CheckAppBetaPasswordCallback result = await SteamApps.CheckAppBetaPassword(appId, password);
+            _appBetaPasswords[appId] = result.BetaPasswords;
             return result.Result != EResult.OK ? null : result.BetaPasswords;
         }
 
@@ -189,28 +175,26 @@ namespace LibDepotDownloader
             return response.Result != EResult.OK ? null : response;
         }
 
-        public async Task<IReadOnlyCollection<SteamApps.LicenseListCallback.License>?> GetLicenseListAsync() =>
-            await Task.Run(() =>
-            {
-                while (_licenseList is null)
-                    _callbackManager.RunWaitCallbacks();
-                return _licenseList;
-            });
+        public async ValueTask<ReadOnlyCollection<SteamApps.LicenseListCallback.License>> GetLicenseListAsync()
+        {
+            SteamApps.LicenseListCallback callback = await _licenseListTsc.Task.ConfigureAwait(false);
+            return callback.LicenseList;
+        }
 
         public async Task<bool> GetAccountHasAccessAsync(uint appId, uint depotId)
         {
             if (_steamUser.SteamID is null || appId == SteamConstants.InvalidAppId)
                 return false;
 
-            IList<uint> licenseQuery;
+            List<uint> licenseQuery;
             if (_steamUser.SteamID.AccountType == EAccountType.AnonUser)
             {
                 licenseQuery = new List<uint> { 17906 };
             }
             else
             {
-                IReadOnlyCollection<SteamApps.LicenseListCallback.License>? licenses = await GetLicenseListAsync();
-                if (licenses?.Select(static x => x.PackageID) is not { } packageIds)
+                ReadOnlyCollection<SteamApps.LicenseListCallback.License> licenses = await GetLicenseListAsync();
+                if (licenses.Select(static x => x.PackageID) is not { } packageIds)
                     return false;
                 licenseQuery = packageIds.ToList();
             }
@@ -232,105 +216,22 @@ namespace LibDepotDownloader
             return false;
         }
 
-        private async void OnConnectedAsync(SteamClient.ConnectedCallback connected)
+        private void OnConnected(SteamClient.ConnectedCallback connected)
         {
             _isConnected = true;
-            if (_logOnDetails.Username is null)
-            {
-                _steamUser.LogOnAnonymous();
-            }
-            else
-            {
-                if (_authSession is null)
-                {
-                    if (_logOnDetails is { Username: not null, Password: not null, AccessToken: null })
-                    {
-                        try
-                        {
-                            _authSession = await _steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
-                            {
-                                Username = _logOnDetails.Username,
-                                Password = _logOnDetails.Password,
-                                IsPersistentSession = _downloadConfig.RememberPassword,
-                                GuardData = _previousGuardData,
-                                Authenticator = _steamAuthenticator
-                            });
-                        }
-                        catch (AuthenticationException)
-                        {
-                            (_logOnDetails.Username, _logOnDetails.Password, _logOnDetails.ShouldRememberPassword) = await _steamAuthenticator.ProvideLoginDetailsAsync();
-                            Reconnect();
-                            return;
-                        }
-                        catch (Exception)
-                        {
-                            Disconnect(false);
-                            return;
-                        }
-                    }
-                    else if (_logOnDetails.AccessToken is null && _downloadConfig.UseQrCode)
-                    {
-                        try
-                        {
-                            QrAuthSession session = await _steamClient.Authentication.BeginAuthSessionViaQRAsync(new AuthSessionDetails
-                            {
-                                IsPersistentSession = _downloadConfig.RememberPassword,
-                                Authenticator = _steamAuthenticator
-                            });
+            _connectTcs?.TrySetResult();
+        }
 
-                            _authSession = session;
-
-                            // Steam will periodically refresh the challenge url, so we need a new QR code.
-                            session.ChallengeURLChanged = async () => await _steamAuthenticator.DisplayQrCode(session.ChallengeURL);
-
-                            // Draw initial QR code immediately
-                            await _steamAuthenticator.DisplayQrCode(session.ChallengeURL);
-                        }
-                        catch (Exception)
-                        {
-                            Disconnect(false);
-                            return;
-                        }
-                    }
-                }
-
-                if (_authSession is not null)
-                {
-                    try
-                    {
-                        AuthPollResult result = await _authSession.PollingWaitForResultAsync();
-
-                        if (!string.IsNullOrEmpty(result.NewGuardData))
-                            _previousGuardData = result.NewGuardData;
-
-                        _logOnDetails.Username = result.AccountName;
-                        _logOnDetails.Password = null;
-                        _logOnDetails.AccessToken = result.RefreshToken;
-
-                        //AccountSettingsStore.Instance.LoginTokens[result.AccountName] = result.RefreshToken;
-                        //AccountSettingsStore.Save();
-                    }
-                    catch (Exception)
-                    {
-                        Disconnect(false);
-                        return;
-                    }
-
-                    _authSession = null;
-                }
-
-                _steamUser.LogOn(_logOnDetails);
-            }
+        private void OnLoggedOn(SteamUser.LoggedOnCallback loggedOn)
+        {
+            if (loggedOn.Result == EResult.OK)
+                _isLoggedOn = true;
+            _logOnTcs?.TrySetResult(loggedOn.Result);
         }
 
         private void OnDisconnected(SteamClient.DisconnectedCallback disconnected)
         {
             _isConnected = false;
-            if (_reconnect)
-            {
-                _reconnect = false;
-                Connect();
-            }
         }
 
         private void OnLoggedOff(SteamUser.LoggedOffCallback obj)
@@ -338,29 +239,10 @@ namespace LibDepotDownloader
             _isLoggedOn = false;
         }
 
-        private void Connect()
+        /// <inheritdoc />
+        public void Dispose()
         {
-            _steamClient.Connect();
-        }
-
-        private void Disconnect(bool logOff)
-        {
-            if (logOff)
-                _steamUser.LogOff();
-            _steamClient.Disconnect();
-        }
-
-        private void Reconnect()
-        {
-            if (_isConnected)
-            {
-                _reconnect = true;
-                _steamClient.Disconnect();
-            }
-            else
-            {
-                _steamClient.Connect();
-            }
+            SteamClient.Disconnect();
         }
     }
 }
