@@ -122,7 +122,7 @@ namespace LibDepotDownloader
 
             if (details?.hcontent_file > 0)
             {
-                string[]? paths = await DownloadAppAsync(appId, new List<(uint, ulong)> { (appId, details.hcontent_file) }, SteamConstants.DefaultBranch, null, null, null, false, true, cancellationToken, progress);
+                string[]? paths = await DownloadAppAsync(appId, [(appId, details.hcontent_file)], SteamConstants.DefaultBranch, null, null, null, false, true, cancellationToken, progress);
                 if (paths?.Length == 1)
                     return paths[0];
             }
@@ -135,9 +135,9 @@ namespace LibDepotDownloader
             if (!TryCreateDirectories(appId, 0, out string? installDir))
                 return null;
 
-            string stagingDir = Path.Combine(installDir, SteamConstants.StagingDir);
-            string fileStagingPath = Path.Combine(stagingDir, fileName);
-            string fileFinalPath = Path.Combine(installDir, fileName);
+            string stagingDir = Path.Join(installDir, SteamConstants.StagingDir);
+            string fileStagingPath = Path.Join(stagingDir, fileName);
+            string fileFinalPath = Path.Join(installDir, fileName);
 
             Directory.CreateDirectory(Path.GetDirectoryName(fileFinalPath)!);
             Directory.CreateDirectory(Path.GetDirectoryName(fileStagingPath)!);
@@ -298,12 +298,13 @@ namespace LibDepotDownloader
                 {
                     Server connection = cdnClientPool.GetConnection(cancellationToken);
                     DateTime now = DateTime.Now;
+                    SteamContent.CDNAuthToken? cdnToken = await steam3Session.RequestCdnAuthTokenAsync(depot.AppId, depot.DepotId, connection);
 
                     // In order to download this manifest, we need the current manifest request code
                     // The manifest request code is only valid for a specific period in time
                     if (manifestRequestCode == 0 || now >= manifestRequestCodeExpiration)
                     {
-                        manifestRequestCode = await steam3Session.GetDepotManifestRequestCodeAsync(depot.Id, depot.AppId, depot.ManifestId, depot.Branch);
+                        manifestRequestCode = await steam3Session.GetDepotManifestRequestCodeAsync(depot.DepotId, depot.AppId, depot.ManifestId, depot.Branch);
                         // This code will hopefully be valid for one period following the issuing period
                         manifestRequestCodeExpiration = now.Add(TimeSpan.FromMinutes(5));
 
@@ -312,7 +313,7 @@ namespace LibDepotDownloader
                             return null;
                     }
 
-                    newManifest = await cdnClientPool.CdnClient.DownloadManifestAsync(depot.Id, depot.ManifestId, manifestRequestCode, connection, depot.DepotKey, cdnClientPool.ProxyServer).ConfigureAwait(false);
+                    newManifest = await cdnClientPool.CdnClient.DownloadManifestAsync(depot.DepotId, depot.ManifestId, manifestRequestCode, connection, depot.DepotKey, cdnClientPool.ProxyServer, cdnToken?.Token).ConfigureAwait(false);
                     cdnClientPool.ReturnConnection(connection);
                 }
                 catch (TaskCanceledException) { }
@@ -330,11 +331,15 @@ namespace LibDepotDownloader
             // Throw the cancellation exception if requested so that this task is marked failed
             cancellationToken.ThrowIfCancellationRequested();
 
-            newManifest.Files!.Sort(static (x, y) => string.Compare(x.FileName, y.FileName, StringComparison.Ordinal));
+            newManifest.Files!.Sort(
+                static (x, y) => string.Compare(x.FileName, y.FileName, StringComparison.Ordinal)
+                );
 
-            string stagingDir = Path.Combine(depot.InstallDir, SteamConstants.StagingDir);
+            string stagingDir = Path.Join(depot.InstallDir, SteamConstants.StagingDir);
 
-            List<DepotManifest.FileData> filesAfterExclusions = newManifest.Files.AsParallel().Where(f => TestIsFileIncluded(f.FileName)).ToList();
+            List<DepotManifest.FileData> filesAfterExclusions = newManifest.Files.AsParallel()
+                .Where(f => TestIsFileIncluded(f.FileName))
+                .ToList();
             HashSet<string> allFileNames = new(filesAfterExclusions.Count);
 
             // Pre-process
@@ -342,8 +347,8 @@ namespace LibDepotDownloader
             {
                 allFileNames.Add(file.FileName);
 
-                string fileFinalPath = Path.Combine(depot.InstallDir, file.FileName);
-                string fileStagingPath = Path.Combine(stagingDir, file.FileName);
+                string fileFinalPath = Path.Join(depot.InstallDir, file.FileName);
+                string fileStagingPath = Path.Join(stagingDir, file.FileName);
 
                 if (file.Flags.HasFlag(EDepotFileFlag.Directory))
                 {
@@ -392,7 +397,7 @@ namespace LibDepotDownloader
 
                 foreach (string existingFileName in previousFilteredFiles)
                 {
-                    string fileFinalPath = Path.Combine(depotFilesData.DepotDownloadInfo.InstallDir, existingFileName);
+                    string fileFinalPath = Path.Join(depotFilesData.DepotDownloadInfo.InstallDir, existingFileName);
                     IOUtils.TryDeleteFile(fileFinalPath);
                 }
             }
@@ -408,8 +413,8 @@ namespace LibDepotDownloader
             if (oldDepotManifest is not null)
                 oldManifestFile = oldDepotManifest.Files?.SingleOrDefault(f => f.FileName == file.FileName);
 
-            string fileFinalPath = Path.Combine(depot.InstallDir, file.FileName);
-            string fileStagingPath = Path.Combine(depotFilesData.StagingDir, file.FileName);
+            string fileFinalPath = Path.Join(depot.InstallDir, file.FileName);
+            string fileStagingPath = Path.Join(depotFilesData.StagingDir, file.FileName);
 
             // This may still exist if the previous run exited before cleanup
             IOUtils.TryDeleteFile(fileStagingPath);
@@ -556,7 +561,7 @@ namespace LibDepotDownloader
                 networkChunkQueue.Enqueue((fileStreamData, file, chunk));
         }
 
-        private static async Task DownloadSteam3DepotFileChunkAsync(
+        private async Task DownloadSteam3DepotFileChunkAsync(
             CdnClientPool cdnClientPool,
             GlobalDownloadProgress downloadProgress,
             DepotFilesData depotFilesData,
@@ -570,16 +575,8 @@ namespace LibDepotDownloader
             DepotDownloadInfo depot = depotFilesData.DepotDownloadInfo;
             DepotDownloadProgress depotDownloadProgress = depotFilesData.DepotDownloadProgress;
 
-            DepotManifest.ChunkData data = new()
-            {
-                ChunkID = chunk.ChunkID,
-                Checksum = chunk.Checksum,
-                Offset = chunk.Offset,
-                CompressedLength = chunk.CompressedLength,
-                UncompressedLength = chunk.UncompressedLength
-            };
-
-            DepotChunk? chunkData = null;
+            int written = 0;
+            byte[] chunkBuffer = ArrayPool<byte>.Shared.Rent((int)chunk.UncompressedLength);
 
             do
             {
@@ -588,7 +585,9 @@ namespace LibDepotDownloader
                 try
                 {
                     Server connection = cdnClientPool.GetConnection(cancellationToken);
-                    chunkData = await cdnClientPool.CdnClient.DownloadDepotChunkAsync(depot.Id, data,connection, depot.DepotKey, cdnClientPool.ProxyServer).ConfigureAwait(false);
+                    SteamContent.CDNAuthToken? cdnToken = await steam3Session.RequestCdnAuthTokenAsync(depot.AppId, depot.DepotId, connection);
+                    written = await cdnClientPool.CdnClient.DownloadDepotChunkAsync(depot.DepotId, chunk, connection, chunkBuffer, depot.DepotKey, cdnClientPool.ProxyServer, cdnToken?.Token)
+                        .ConfigureAwait(false);
                     cdnClientPool.ReturnConnection(connection);
                 }
                 catch (TaskCanceledException) { }
@@ -601,9 +600,9 @@ namespace LibDepotDownloader
                 {
                     break;
                 }
-            } while (chunkData is null);
+            } while (written == 0);
 
-            if (chunkData is null)
+            if (written == 0)
                 return;
 
             try
@@ -612,16 +611,17 @@ namespace LibDepotDownloader
 
                 if (fileStreamData.FileStream is null)
                 {
-                    string fileFinalPath = Path.Combine(depot.InstallDir, file.FileName);
+                    string fileFinalPath = Path.Join(depot.InstallDir, file.FileName);
                     fileStreamData.FileStream = File.Open(fileFinalPath, FileMode.Open);
                 }
 
-                fileStreamData.FileStream.Seek((long)chunkData.ChunkInfo.Offset, SeekOrigin.Begin);
-                await fileStreamData.FileStream.WriteAsync(chunkData.Data, cancellationToken);
+                fileStreamData.FileStream.Seek((long)chunk.Offset, SeekOrigin.Begin);
+                await fileStreamData.FileStream.WriteAsync(chunkBuffer.AsMemory(0, written), cancellationToken);
             }
             finally
             {
                 fileStreamData.FileLock.Release();
+                ArrayPool<byte>.Shared.Return(chunkBuffer);
             }
 
             int remainingChunks = Interlocked.Decrement(ref fileStreamData.ChunksToDownload);
@@ -634,7 +634,7 @@ namespace LibDepotDownloader
             ulong sizeDownloaded;
             lock (depotDownloadProgress)
             {
-                sizeDownloaded = depotDownloadProgress.SizeDownloaded + (ulong)chunkData.Data.Length;
+                sizeDownloaded = depotDownloadProgress.SizeDownloaded + (ulong)written;
                 depotDownloadProgress.SizeDownloaded = sizeDownloaded;
                 depotDownloadProgress.DepotBytesCompressed += chunk.CompressedLength;
                 depotDownloadProgress.DepotBytesUncompressed += chunk.UncompressedLength;
@@ -677,7 +677,7 @@ namespace LibDepotDownloader
 
             uint uVersion = await GetSteam3AppBuildNumber(appId, branch);
 
-            return !TryCreateDirectories(depotId, uVersion, out string? installDir) ? null : new DepotDownloadInfo(depotId, appId, manifestId, branch, uVersion,  installDir, depotKey);
+            return !TryCreateDirectories(depotId, uVersion, out string? installDir) ? null : new DepotDownloadInfo(depotId, appId, manifestId, branch, installDir, depotKey);
         }
 
         private async Task<uint> GetSteam3AppBuildNumber(uint appId, string branch)
@@ -716,24 +716,21 @@ namespace LibDepotDownloader
                 {
                     Directory.CreateDirectory(SteamConstants.DefaultDownloadDir);
 
-                    string depotPath = Path.Combine(SteamConstants.DefaultDownloadDir, depotId.ToString(NumberFormatInfo.InvariantInfo));
+                    string depotPath = Path.Join(SteamConstants.DefaultDownloadDir, depotId.ToString(NumberFormatInfo.InvariantInfo));
                     Directory.CreateDirectory(depotPath);
 
-                    installDir = Path.Combine(depotPath, depotVersion.ToString(NumberFormatInfo.InvariantInfo));
+                    installDir = Path.Join(depotPath, depotVersion.ToString(NumberFormatInfo.InvariantInfo));
                     Directory.CreateDirectory(installDir);
-
-                    Directory.CreateDirectory(Path.Combine(installDir, SteamConstants.ConfigDir));
-                    Directory.CreateDirectory(Path.Combine(installDir, SteamConstants.StagingDir));
                 }
                 else
                 {
                     Directory.CreateDirectory(downloadConfig.InstallDirectory);
 
                     installDir = downloadConfig.InstallDirectory;
-
-                    Directory.CreateDirectory(Path.Combine(installDir, SteamConstants.ConfigDir));
-                    Directory.CreateDirectory(Path.Combine(installDir, SteamConstants.StagingDir));
                 }
+
+                Directory.CreateDirectory(Path.Join(installDir, SteamConstants.ConfigDir));
+                Directory.CreateDirectory(Path.Join(installDir, SteamConstants.StagingDir));
             }
             catch
             {

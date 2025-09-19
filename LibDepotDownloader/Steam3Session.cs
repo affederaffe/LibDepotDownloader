@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
@@ -7,6 +8,7 @@ using System.Threading.Tasks;
 
 using SteamKit2;
 using SteamKit2.Authentication;
+using SteamKit2.CDN;
 using SteamKit2.Internal;
 
 
@@ -17,11 +19,13 @@ namespace LibDepotDownloader
         private readonly SteamUser.LogOnDetails _logOnDetails = new();
         private readonly SteamUser _steamUser;
         private readonly SteamCloud _steamCloud;
-        private readonly SteamUnifiedMessages.UnifiedService<IPublishedFile> _steamPublishedFile;
+        private readonly PublishedFile _steamPublishedFile;
+        private readonly CallbackManager _callbackManager;
 
         private readonly Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo> _appInfos = [];
         private readonly Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo> _packageInfos = [];
         private readonly Dictionary<uint, Dictionary<string, byte[]>> _appBetaPasswords = [];
+        private readonly ConcurrentDictionary<(uint depotId, string? host), Task<SteamContent.CDNAuthToken>> _cdnAuthTokens = [];
 
         private readonly TaskCompletionSource<SteamApps.LicenseListCallback> _licenseListTsc = new();
 
@@ -33,20 +37,22 @@ namespace LibDepotDownloader
 
         public Steam3Session()
         {
-            SteamConfiguration config = SteamConfiguration.Create(static builder => builder
-                .WithHttpClientFactory(HttpClientFactory.CreateIPv4HttpClient));
+            SteamConfiguration config = SteamConfiguration.Create(config =>
+                config.WithHttpClientFactory(static _ => HttpClientFactory.CreateIPv4HttpClient())
+            );
             SteamClient = new SteamClient(config);
             _steamUser = SteamClient.GetHandler<SteamUser>()!;
             SteamApps = SteamClient.GetHandler<SteamApps>()!;
             SteamContent = SteamClient.GetHandler<SteamContent>()!;
             _steamCloud = SteamClient.GetHandler<SteamCloud>()!;
             SteamUnifiedMessages steamUnifiedMessages = SteamClient.GetHandler<SteamUnifiedMessages>()!;
-            _steamPublishedFile = steamUnifiedMessages.CreateService<IPublishedFile>();
-            SteamClient.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
-            SteamClient.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
-            SteamClient.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
-            SteamClient.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
-            SteamClient.Subscribe<SteamApps.LicenseListCallback>(OnLicenseList);
+            _steamPublishedFile = steamUnifiedMessages.CreateService<PublishedFile>();
+            _callbackManager = new CallbackManager(SteamClient);
+            _callbackManager.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
+            _callbackManager.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
+            _callbackManager.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
+            _callbackManager.Subscribe<SteamUser.LoggedOffCallback>(OnLoggedOff);
+            _callbackManager.Subscribe<SteamApps.LicenseListCallback>(OnLicenseList);
         }
 
         public async ValueTask ConnectAsync(CancellationToken cancellationToken)
@@ -133,6 +139,20 @@ namespace LibDepotDownloader
 
             return _packageInfos;
         }
+        
+        public async Task<SteamContent.CDNAuthToken?> RequestCdnAuthTokenAsync(uint appid, uint depotId, Server server)
+        {
+            (uint depotId, string? host) cdnKey = (depotId, server.Host);
+            if (_cdnAuthTokens.TryGetValue(cdnKey, out Task<SteamContent.CDNAuthToken>? task))
+                return await task;
+
+            Task<SteamContent.CDNAuthToken> cdnAuthTokenTask = SteamContent.GetCDNAuthToken(appid, depotId, server.Host ?? "");
+            _cdnAuthTokens.TryAdd(cdnKey, cdnAuthTokenTask);
+            
+            SteamContent.CDNAuthToken cdnAuthToken = await cdnAuthTokenTask;
+            return cdnAuthToken.Result != EResult.OK ? null : cdnAuthToken;
+        }
+
 
         public async Task<bool> TryRequestFreeAppLicenseAsync(uint appId)
         {
@@ -162,11 +182,8 @@ namespace LibDepotDownloader
         {
             CPublishedFile_GetDetails_Request publishedFileRequest = new() { appid = appId };
             publishedFileRequest.publishedfileids.Add(publishedFileId);
-            SteamUnifiedMessages.ServiceMethodResponse response = await _steamPublishedFile.SendMessage(api => api.GetDetails(publishedFileRequest));
-            if (response.Result != EResult.OK)
-                return null;
-            CPublishedFile_GetDetails_Response getDetailsResponse = response.GetDeserializedResponse<CPublishedFile_GetDetails_Response>();
-            return getDetailsResponse.publishedfiledetails.FirstOrDefault();
+            SteamUnifiedMessages.ServiceMethodResponse<CPublishedFile_GetDetails_Response> response = await _steamPublishedFile.GetDetails(publishedFileRequest);
+            return response.Result != EResult.OK ? null : response.Body.publishedfiledetails.FirstOrDefault();
         }
 
         public async Task<SteamCloud.UGCDetailsCallback?> GetUgcDetailsAsync(UGCHandle ugcHandle)
