@@ -304,7 +304,7 @@ namespace LibDepotDownloader
                     // The manifest request code is only valid for a specific period in time
                     if (manifestRequestCode == 0 || now >= manifestRequestCodeExpiration)
                     {
-                        manifestRequestCode = await steam3Session.GetDepotManifestRequestCodeAsync(depot.DepotId, depot.AppId, depot.ManifestId, depot.Branch);
+                        manifestRequestCode = await steam3Session.SteamContent.GetManifestRequestCode(depot.DepotId, depot.AppId, depot.ManifestId, depot.Branch);
                         // This code will hopefully be valid for one period following the issuing period
                         manifestRequestCodeExpiration = now.Add(TimeSpan.FromMinutes(5));
 

@@ -7,7 +7,6 @@ using System.Threading;
 using System.Threading.Tasks;
 
 using SteamKit2;
-using SteamKit2.Authentication;
 using SteamKit2.CDN;
 using SteamKit2.Internal;
 
@@ -16,8 +15,6 @@ namespace LibDepotDownloader
 {
     public sealed class Steam3Session : IAsyncDisposable
     {
-        private readonly SteamUser.LogOnDetails _logOnDetails = new();
-        private readonly PublishedFile _steamPublishedFile;
         private readonly Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo> _appInfos = [];
         private readonly Dictionary<uint, SteamApps.PICSProductInfoCallback.PICSProductInfo> _packageInfos = [];
         private readonly Dictionary<uint, Dictionary<string, byte[]>> _appBetaPasswords = [];
@@ -41,7 +38,7 @@ namespace LibDepotDownloader
             SteamContent = SteamClient.GetHandler<SteamContent>()!;
             SteamCloud = SteamClient.GetHandler<SteamCloud>()!;
             SteamUnifiedMessages = SteamClient.GetHandler<SteamUnifiedMessages>()!;
-            _steamPublishedFile = SteamUnifiedMessages.CreateService<PublishedFile>();
+            SteamPublishedFile = SteamUnifiedMessages.CreateService<PublishedFile>();
 
             CallbackManager = new CallbackManager(SteamClient);
             CallbackManager.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
@@ -49,42 +46,6 @@ namespace LibDepotDownloader
             CallbackManager.Subscribe<SteamApps.LicenseListCallback>(OnLicenseList);
 
             _dispatchTask = Task.Factory.StartNew(DispatchCallbacks).Unwrap();
-        }
-
-        private async Task DispatchCallbacks()
-        {
-            while (!_shutdownToken.IsCancellationRequested)
-            {
-                await CallbackManager.RunWaitCallbackAsync();
-            }
-        }
-
-        public async ValueTask ConnectAsync(CancellationToken cancellationToken)
-        {
-            if (SteamClient.IsConnected)
-                return;
-
-            _connectTcs = new TaskCompletionSource();
-            await using CancellationTokenRegistration disposable = cancellationToken.Register(() => _connectTcs.TrySetCanceled());
-            SteamClient.Connect();
-            await _connectTcs.Task;
-            _connectTcs = null;
-        }
-
-        public async ValueTask<EResult> LogOnAsync(AuthPollResult authPollResult, bool isPersistentSession, CancellationToken cancellationToken)
-        {
-            if (SteamClient.SteamID is not null)
-                return EResult.OK;
-
-            _logOnTcs = new TaskCompletionSource<EResult>();
-            await using CancellationTokenRegistration disposable = cancellationToken.Register(() => _logOnTcs.TrySetCanceled());
-            _logOnDetails.Username = authPollResult.AccountName;
-            _logOnDetails.AccessToken = authPollResult.RefreshToken;
-            _logOnDetails.ShouldRememberPassword = isPersistentSession;
-            SteamUser.LogOn(_logOnDetails);
-            EResult result = await _logOnTcs.Task;
-            _logOnTcs = null;
-            return result;
         }
 
         public SteamClient SteamClient { get; }
@@ -98,8 +59,43 @@ namespace LibDepotDownloader
         public SteamCloud SteamCloud { get; }
         
         public SteamUnifiedMessages SteamUnifiedMessages { get; }
-        
+
+        public PublishedFile SteamPublishedFile { get; }
+
         public CallbackManager CallbackManager { get; }
+
+        private async Task DispatchCallbacks()
+        {
+            while (!_shutdownToken.IsCancellationRequested)
+            {
+                await CallbackManager.RunWaitCallbackAsync();
+            }
+        }
+
+        public async ValueTask ConnectAsync(CancellationToken cancellationToken = default)
+        {
+            if (SteamClient.IsConnected)
+                return;
+
+            _connectTcs = new TaskCompletionSource();
+            await using CancellationTokenRegistration disposable = cancellationToken.Register(() => _connectTcs.TrySetCanceled());
+            SteamClient.Connect();
+            await _connectTcs.Task;
+            _connectTcs = null;
+        }
+
+        public async ValueTask<EResult> LogOnAsync(SteamUser.LogOnDetails logOnDetails, CancellationToken cancellationToken = default)
+        {
+            if (SteamClient.SteamID is not null)
+                return EResult.OK;
+
+            _logOnTcs = new TaskCompletionSource<EResult>();
+            await using CancellationTokenRegistration disposable = cancellationToken.Register(() => _logOnTcs.TrySetCanceled());
+            SteamUser.LogOn(logOnDetails);
+            EResult result = await _logOnTcs.Task;
+            _logOnTcs = null;
+            return result;
+        }
 
         public async Task<SteamApps.PICSProductInfoCallback.PICSProductInfo?> GetAppInfoAsync(uint appId)
         {
@@ -177,8 +173,6 @@ namespace LibDepotDownloader
             return response.Result != EResult.OK ? null : response.DepotKey;
         }
 
-        public async Task<ulong> GetDepotManifestRequestCodeAsync(uint depotId, uint appId, ulong manifestId, string branch) => await SteamContent.GetManifestRequestCode(depotId, appId, manifestId, branch);
-
         public async Task<Dictionary<string, byte[]>?> GetAppBetaKeysAsync(uint appId, string password)
         {
             if (_appBetaPasswords.TryGetValue(appId, out Dictionary<string, byte[]>? appBetaPasswords))
@@ -193,7 +187,7 @@ namespace LibDepotDownloader
         {
             CPublishedFile_GetDetails_Request publishedFileRequest = new() { appid = appId };
             publishedFileRequest.publishedfileids.Add(publishedFileId);
-            SteamUnifiedMessages.ServiceMethodResponse<CPublishedFile_GetDetails_Response> response = await _steamPublishedFile.GetDetails(publishedFileRequest);
+            SteamUnifiedMessages.ServiceMethodResponse<CPublishedFile_GetDetails_Response> response = await SteamPublishedFile.GetDetails(publishedFileRequest);
             return response.Result != EResult.OK ? null : response.Body.publishedfiledetails.FirstOrDefault();
         }
 
